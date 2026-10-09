@@ -1,0 +1,272 @@
+name: Build AirCursor
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Keep the same signing key between builds
+        uses: actions/cache@v5
+        with:
+          path: ~/.android/debug.keystore
+          key: aircursor-debug-keystore
+
+      - name: Create the Android project
+        run: |
+          mkdir -p app/src/main/java/com/aircursor/app app/src/main/res/xml app/src/main/res/values app/src/main/res/drawable app/src/main/assets
+          cp CursorService.kt app/src/main/java/com/aircursor/app/
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "AirCursor"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.1.0" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.aircursor.app"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.aircursor.app"
+                  minSdk = 33
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+                  ndk {
+                      abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              androidResources {
+                  noCompress.add("task")
+              }
+          }
+
+          kotlin {
+              compilerOptions {
+                  jvmTarget.set(JvmTarget.JVM_17)
+              }
+          }
+
+          dependencies {
+              implementation("androidx.camera:camera-camera2:1.4.1")
+              implementation("androidx.camera:camera-lifecycle:1.4.1")
+              implementation("androidx.lifecycle:lifecycle-runtime:2.8.7")
+              implementation("com.google.mediapipe:tasks-vision:0.10.14")
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-feature android:name="android.hardware.camera.front" android:required="false" />
+
+              <application
+                  android:label="@string/app_name"
+                  android:icon="@drawable/ic_launcher"
+                  android:theme="@android:style/Theme.DeviceDefault">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".CursorService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">AirCursor</string>
+              <string name="a11y_desc">Move a cursor by moving your hand in front of the front camera. Pinch your thumb and index finger together to tap.</string>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/xml/accessibility_config.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:description="@string/a11y_desc"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:notificationTimeout="100"
+              android:canPerformGestures="true" />
+          EOF
+
+          cat > app/src/main/res/drawable/ic_launcher.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path android:fillColor="#5B3DF5" android:pathData="M0,0h108v108h-108z" />
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:strokeColor="#000000"
+                  android:strokeWidth="5"
+                  android:pathData="M54,30a24,24 0 1,1 0,48a24,24 0 1,1 0,-48z" />
+          </vector>
+          EOF
+
+          cat > app/src/main/java/com/aircursor/app/MainActivity.kt <<'EOF'
+          package com.aircursor.app
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+
+              private lateinit var status: TextView
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val pad = (24 * resources.displayMetrics.density).toInt()
+
+                  val title = TextView(this).apply {
+                      text = "AirCursor"
+                      textSize = 32f
+                      gravity = Gravity.CENTER
+                  }
+                  status = TextView(this).apply {
+                      textSize = 18f
+                      gravity = Gravity.CENTER
+                      setPadding(0, pad, 0, pad)
+                  }
+                  val cameraButton = Button(this).apply {
+                      text = "1. Allow camera"
+                      setOnClickListener { requestPermissions(arrayOf(Manifest.permission.CAMERA), 1) }
+                  }
+                  val serviceButton = Button(this).apply {
+                      text = "2. Turn on AirCursor"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  }
+
+                  val layout = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setPadding(pad, pad, pad, pad)
+                      addView(title)
+                      addView(status)
+                      addView(cameraButton)
+                      addView(serviceButton)
+                  }
+                  setContentView(layout)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  refresh()
+              }
+
+              override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  refresh()
+              }
+
+              private fun refresh() {
+                  val granted = checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+                  status.text = if (granted) "Camera allowed. Now tap 2 and switch on AirCursor." else "Tap 1 and allow the camera."
+              }
+          }
+          EOF
+
+      - name: Download the hand tracking model
+        run: curl -fsSL -o app/src/main/assets/hand_landmarker.task https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task
+
+      - name: Build the APK
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/gradle.zip" https://services.gradle.org/distributions/gradle-8.10.2-bin.zip
+          unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
+          "$RUNNER_TEMP/gradle-8.10.2/bin/gradle" assembleDebug --no-daemon
+
+      - name: Publish the APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk AirCursor.apk
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest AirCursor.apk --target "${{ github.sha }}" --title "AirCursor latest build" --notes "Tap AirCursor.apk below to download it."
