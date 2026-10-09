@@ -39,11 +39,13 @@ import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.sqrt
 
 // AirCursor: the front camera tracks your hand, a cursor follows the spot
-// between your thumb and index tip, pinch them together to tap.
+// between your thumb and index tip.
+// Quick pinch = tap. Pinch, move your hand, let go = swipe (scroll).
 class CursorService : AccessibilityService(), LifecycleOwner {
 
     // Tuning knobs, we tweak these after testing
@@ -52,6 +54,7 @@ class CursorService : AccessibilityService(), LifecycleOwner {
     private val smoothing = 0.35f  // lower = smoother but laggier
     private val pinchOn = 0.25f    // thumb/index gap (vs hand size) that counts as a pinch
     private val pinchOff = 0.40f   // gap needed to let go of the pinch
+    private val dragDp = 40        // move less than this while pinched = tap, more = swipe
     private val cursorDp = 28
 
     private val registry = LifecycleRegistry(this)
@@ -75,6 +78,9 @@ class CursorService : AccessibilityService(), LifecycleOwner {
     private var pinching = false
     private var pinchFrames = 0
     private var missFrames = 0
+    private var startX = 0f
+    private var startY = 0f
+    private var startTime = 0L
 
     private val displayListener = object : DisplayManager.DisplayListener {
         override fun onDisplayAdded(displayId: Int) {}
@@ -224,7 +230,7 @@ class CursorService : AccessibilityService(), LifecycleOwner {
             curX = tx
             curY = ty
             hasPos = true
-        } else if (!pinching) {
+        } else {
             curX += (tx - curX) * smoothing
             curY += (ty - curY) * smoothing
         }
@@ -232,12 +238,23 @@ class CursorService : AccessibilityService(), LifecycleOwner {
         if (!pinching) {
             pinchFrames = if (ratio < pinchOn) pinchFrames + 1 else 0
             if (pinchFrames >= 2) {
+                // Finger down: remember where the pinch started
                 pinching = true
-                tap(curX, curY)
+                startX = curX
+                startY = curY
+                startTime = SystemClock.uptimeMillis()
             }
         } else if (ratio > pinchOff) {
+            // Finger up: small move = tap, bigger move = swipe
             pinching = false
             pinchFrames = 0
+            val moved = hypot(curX - startX, curY - startY)
+            if (moved < dragDp * resources.displayMetrics.density) {
+                tap(startX, startY)
+            } else {
+                val held = (SystemClock.uptimeMillis() - startTime).coerceIn(100L, 1000L)
+                swipe(startX, startY, curX, curY, held)
+            }
         }
         moveCursor(curX, curY, pinching)
     }
@@ -255,6 +272,15 @@ class CursorService : AccessibilityService(), LifecycleOwner {
     private fun tap(x: Float, y: Float) {
         val path = Path().apply { moveTo(x, y) }
         val stroke = GestureDescription.StrokeDescription(path, 0L, 60L)
+        dispatchGesture(GestureDescription.Builder().addStroke(stroke).build(), null, null)
+    }
+
+    private fun swipe(x1: Float, y1: Float, x2: Float, y2: Float, durationMs: Long) {
+        val path = Path().apply {
+            moveTo(x1, y1)
+            lineTo(x2, y2)
+        }
+        val stroke = GestureDescription.StrokeDescription(path, 0L, durationMs)
         dispatchGesture(GestureDescription.Builder().addStroke(stroke).build(), null, null)
     }
 
