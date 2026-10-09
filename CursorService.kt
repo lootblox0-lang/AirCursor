@@ -41,11 +41,12 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.hypot
 import kotlin.math.max
+import kotlin.math.round
 import kotlin.math.sqrt
 
 // AirCursor: the front camera tracks your hand, a cursor follows the spot
-// between your thumb and index tip.
-// Quick pinch = tap. Pinch, move your hand, let go = swipe (scroll).
+// between your thumb and index tip. Pinching works like a real finger:
+// pinch = finger down, move = drag, open = finger up.
 class CursorService : AccessibilityService(), LifecycleOwner {
 
     // Tuning knobs, we tweak these after testing
@@ -54,7 +55,8 @@ class CursorService : AccessibilityService(), LifecycleOwner {
     private val smoothing = 0.35f  // lower = smoother but laggier
     private val pinchOn = 0.25f    // thumb/index gap (vs hand size) that counts as a pinch
     private val pinchOff = 0.40f   // gap needed to let go of the pinch
-    private val dragDp = 40        // move less than this while pinched = tap, more = swipe
+    private val slopDp = 12        // how far you move while pinched before it starts dragging
+    private val moveMs = 30L       // length of each drag step sent to Android
     private val cursorDp = 28
 
     private val registry = LifecycleRegistry(this)
@@ -72,15 +74,26 @@ class CursorService : AccessibilityService(), LifecycleOwner {
     private lateinit var cursorParams: WindowManager.LayoutParams
     private var cursorView: CursorView? = null
 
+    // Hand and cursor state
     private var curX = 0f
     private var curY = 0f
     private var hasPos = false
     private var pinching = false
     private var pinchFrames = 0
     private var missFrames = 0
-    private var startX = 0f
-    private var startY = 0f
-    private var startTime = 0L
+
+    // Fake finger state
+    private var stroke: GestureDescription.StrokeDescription? = null
+    private var fingerX = 0f
+    private var fingerY = 0f
+    private var downX = 0f
+    private var downY = 0f
+    private var dragging = false
+    private var gestureBusy = false
+    private var liftPending = false
+    private var liftX = 0f
+    private var liftY = 0f
+    private var sendId = 0
 
     private val displayListener = object : DisplayManager.DisplayListener {
         override fun onDisplayAdded(displayId: Int) {}
@@ -238,23 +251,15 @@ class CursorService : AccessibilityService(), LifecycleOwner {
         if (!pinching) {
             pinchFrames = if (ratio < pinchOn) pinchFrames + 1 else 0
             if (pinchFrames >= 2) {
-                // Finger down: remember where the pinch started
                 pinching = true
-                startX = curX
-                startY = curY
-                startTime = SystemClock.uptimeMillis()
+                fingerDown(curX, curY)
             }
         } else if (ratio > pinchOff) {
-            // Finger up: small move = tap, bigger move = swipe
             pinching = false
             pinchFrames = 0
-            val moved = hypot(curX - startX, curY - startY)
-            if (moved < dragDp * resources.displayMetrics.density) {
-                tap(startX, startY)
-            } else {
-                val held = (SystemClock.uptimeMillis() - startTime).coerceIn(100L, 1000L)
-                swipe(startX, startY, curX, curY, held)
-            }
+            fingerUp(curX, curY)
+        } else {
+            fingerMove(curX, curY)
         }
         moveCursor(curX, curY, pinching)
     }
@@ -262,6 +267,7 @@ class CursorService : AccessibilityService(), LifecycleOwner {
     private fun onNoHand() {
         missFrames++
         if (missFrames >= 5) {
+            if (pinching) fingerUp(curX, curY)
             hasPos = false
             pinching = false
             pinchFrames = 0
@@ -269,19 +275,92 @@ class CursorService : AccessibilityService(), LifecycleOwner {
         }
     }
 
-    private fun tap(x: Float, y: Float) {
-        val path = Path().apply { moveTo(x, y) }
-        val stroke = GestureDescription.StrokeDescription(path, 0L, 60L)
-        dispatchGesture(GestureDescription.Builder().addStroke(stroke).build(), null, null)
+    // Finger down: press and keep holding
+    private fun fingerDown(x: Float, y: Float) {
+        val sx = round(x)
+        val sy = round(y)
+        val path = Path().apply { moveTo(sx, sy) }
+        val s = GestureDescription.StrokeDescription(path, 0L, 10L, true)
+        stroke = s
+        fingerX = sx
+        fingerY = sy
+        downX = sx
+        downY = sy
+        dragging = false
+        liftPending = false
+        send(s)
     }
 
-    private fun swipe(x1: Float, y1: Float, x2: Float, y2: Float, durationMs: Long) {
-        val path = Path().apply {
-            moveTo(x1, y1)
-            lineTo(x2, y2)
+    // Finger moving: send the next bit of the drag, one step at a time
+    private fun fingerMove(x: Float, y: Float) {
+        val prev = stroke ?: return
+        if (gestureBusy) return
+        val nx = round(x)
+        val ny = round(y)
+        if (!dragging) {
+            if (hypot(nx - downX, ny - downY) < slopDp * resources.displayMetrics.density) return
+            dragging = true
         }
-        val stroke = GestureDescription.StrokeDescription(path, 0L, durationMs)
-        dispatchGesture(GestureDescription.Builder().addStroke(stroke).build(), null, null)
+        if (nx == fingerX && ny == fingerY) return
+        val path = Path().apply {
+            moveTo(fingerX, fingerY)
+            lineTo(nx, ny)
+        }
+        val s = prev.continueStroke(path, 0L, moveMs, true)
+        stroke = s
+        fingerX = nx
+        fingerY = ny
+        send(s)
+    }
+
+    // Finger up: let go (waits if a drag step is still running)
+    private fun fingerUp(x: Float, y: Float) {
+        if (stroke == null) return
+        if (gestureBusy) {
+            liftPending = true
+            liftX = x
+            liftY = y
+            return
+        }
+        lift(x, y)
+    }
+
+    private fun lift(x: Float, y: Float) {
+        val prev = stroke ?: return
+        liftPending = false
+        val nx = round(x)
+        val ny = round(y)
+        val moving = dragging && (nx != fingerX || ny != fingerY)
+        val path = Path().apply {
+            moveTo(fingerX, fingerY)
+            if (moving) lineTo(nx, ny)
+        }
+        stroke = null
+        send(prev.continueStroke(path, 0L, if (moving) moveMs else 10L, false))
+    }
+
+    private fun send(s: GestureDescription.StrokeDescription) {
+        val id = ++sendId
+        gestureBusy = true
+        val callback = object : AccessibilityService.GestureResultCallback() {
+            override fun onCompleted(gestureDescription: GestureDescription?) {
+                if (id != sendId) return
+                gestureBusy = false
+                if (liftPending) lift(liftX, liftY)
+            }
+
+            override fun onCancelled(gestureDescription: GestureDescription?) {
+                if (id != sendId) return
+                gestureBusy = false
+                liftPending = false
+                stroke = null
+            }
+        }
+        val gesture = GestureDescription.Builder().addStroke(s).build()
+        if (!dispatchGesture(gesture, callback, main)) {
+            gestureBusy = false
+            stroke = null
+        }
     }
 
     private fun addCursor() {
